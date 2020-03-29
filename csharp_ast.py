@@ -199,15 +199,23 @@ class ParametersAST(AST):
         opens = '({[<'
         closes = ')}]>'
         s = 0
+        stg = False
         for i in string[1:-1]:
-            if i in opens:
-                s += 1
-            if i in closes:
-                s -= 1
-            if s == 0 and i == ',':
-                res.append("")
+            if not stg:
+                if i in opens:
+                    s += 1
+                if i in closes:
+                    s -= 1
+                if s == 0 and i == ',':
+                    res.append("")
+                else:
+                    res[-1] += i
+                if i == '"':
+                    stg = True
             else:
                 res[-1] += i
+                if i == '"':
+                    stg = False
         if not res[-1].strip():
             res.pop()
         return res
