@@ -4,11 +4,10 @@ import re
 class AST:
     NAME_PATTERN = '\@?[a-zA-Z\_][a-zA-Z0-9\_]*'
     DOTTED_NAME_PATTERN = f'{NAME_PATTERN}(\??\.{NAME_PATTERN})*'
-    NUMBER = "([0-9]+(\.[0-9]*)?)(?![0-9\.])"
+    NUMBER = "([0-9]+(\.[0-9]*)?)(?![0-9\.])d?"
     STRING_PART = '[^"]*'
     STRING = f'@?"{STRING_PART}(\\"{STRING_PART})*"'
     CONSTANT = f"({NUMBER}|{NAME_PATTERN}|{STRING})"
-    DOTTED_MEMBER_NAME_PATTERN = f'{NAME_PATTERN}(\??(\.{NAME_PATTERN}|\[{CONSTANT}\]))*'
 
     def __init__(self, children):
         self.children = children
@@ -35,19 +34,26 @@ class AST:
         return string
 
     @staticmethod
-    def split(string):
+    def split(string, end='}'):
         opens = '([{'
         closes = ')]}'
         s = 0
         res = [""]
+        stg = False
         for i in string:
             res[-1] += i
-            if i in opens:
-                s += 1
-            if i in closes:
-                s -= 1
-                if s == 0 and i == '}':
-                    res.append("")
+            if not stg:
+                if i in opens:
+                    s += 1
+                if i in closes:
+                    s -= 1
+                    if s == 0 and i == end:
+                        res.append("")
+                if i == '"':
+                    stg = True
+            else:
+                if i == '"':
+                    stg = False
         while res and not res[-1].strip():
             res.pop()
         return res
@@ -82,18 +88,49 @@ class AST:
         if btp in ['new', 'delegate']:
             return None, None
         l = len(btp)
+        if len(string) == l:
+            return btp, ""
         if string[l:].strip()[0] == "<":
             return cls.split_first(string, opensadd="<", closesadd=">", end=">")
         if string[l:].strip()[0] == "[":
             start, string = string[:l], string[l:].strip()
-            while string[0] == "[":
+            while string and string[0] == "[":
                 st, string = cls.split_first(string, end="]")
                 start += st
             return start, string
         return btp, string[len(btp):].strip()
+    
+    @classmethod
+    def get_dotted_member_name(cls, string):
+        obj = re.match(cls.NAME_PATTERN, string)
+        if obj is None:
+            return None, None
+        ind = obj.end()
+        name, string = DottedName(string[:ind]), string[ind:].strip()
+        if string and string[0] in ".[":
+            dot = string[0] == '.'
+            if dot:
+                string = string[1:]
+                ind = re.match(cls.NAME_PATTERN, string).end()
+                name2, string = string[:ind], string[ind:].strip()
+                name = DottedName([name, DottedName(name2)])
+            else:
+                expr, string = cls.split_first(string, end=']')
+                expr = ExpressionAST.parse(expr[1:-1].strip())
+                string = string.strip()
+                name = DottedName([name, expr])
+            if string and string[0] in '.[':
+                rem, string = cls.get_dotted_member_name("A" + string)
+                string = string.strip()
+                assert not string or string[0] not in '.['
+                name = DottedName(name.children + rem.children[1:])
+        return name, string
+    
+    @staticmethod
+    def startswith(string, start):
+        return re.match(start + '(?![a-zA-Z0-9\_\@])', string) is not None
 
-
-    def __repr__(self, tab=0):
+    def __repr__(self, tab=0, **kwargs):
         return ('  ' * tab + type(self).__name__ + '\n'
                 + '\n'.join([child.__repr__(tab + 1)
                              for child in self.children
@@ -115,7 +152,7 @@ class ExprAST(AST):
 class DefinitionWithBaseAST(AST):
     @classmethod
     def parse(cls, string):
-        children = list(map(str.strip, cls.split(string)))
+        children = list(map(str.strip, cls.split(string, end=')')))
         assert len(children) <= 2
         definition = DefinitionAST.parse(children[0])
         if len(children) == 1:
@@ -128,14 +165,23 @@ class DefinitionAST(AST):
     @classmethod
     def parse(cls, string):
         ind = string.index('(')
-        return __class__([*map(DottedName,
-                               string[:ind].strip().split()),
+        return __class__([*cls.get_function_def(string[:ind].strip()),
                           ParametersAST.parse(string[ind:])])
+
+    @classmethod
+    def get_function_def(cls, string):
+        tps = []
+        while string:
+            tp, string = cls.get_type(string)
+            string = string.strip()
+            tps.append(tp)
+        return map(DottedName, tps)
 
 
 class DefinitionBaseAST(AST):
     @classmethod
     def parse(cls, string):
+        return None # FIXME:
         assert string[0] == ':'
         return __class__([DefinitionAST.parse(string[1:])])
 
@@ -150,8 +196,8 @@ class ParametersAST(AST):
         string = string.strip()
         assert string[0] == '(' and string[-1] == ')'
         res = [""]
-        opens = '({['
-        closes = ')}]'
+        opens = '({[<'
+        closes = ')}]>'
         s = 0
         for i in string[1:-1]:
             if i in opens:
@@ -181,7 +227,12 @@ class ParameterTypeName(AST):
     @classmethod
     def parse(cls, string):
         # ['ref' | 'out'] Type Variable_name
-        return __class__(list(map(DottedName, string.strip().split())))
+        param = re.findall(cls.NAME_PATTERN, string.strip())[-1]
+        tp = string[:-len(param)].strip()
+        tps = [tp]
+        if cls.startswith(tp, 'ref') or cls.startswith(tp, 'out'):
+            tps = [tp[:3], tp[3:].strip()]
+        return __class__(list(map(DottedName, [*tps, param])))
 
 
 class ParameterValue(AST):
@@ -276,6 +327,8 @@ class StatementsAST(AST):
             return ThrowStatement([expr]), string[1:].strip()
 
         if cls.startswith(string, 'return'):
+            if string[6:].strip()[0] == ';':
+                return ReturnStatement([]), string[6:].strip()[1:].strip()
             expr, string = ExpressionAST.get_expression(
                 string[6:].strip())
             string = string.strip()
@@ -319,6 +372,19 @@ class StatementsAST(AST):
             string = string.strip()
             assert string[0] == ';'
             return DoWhileStatement([body, expr]), string[1:].strip()
+
+        if cls.startswith(string, "using"):
+            # TODO: using var x = new X();
+            string = string[5:].strip()
+            assert string[0] == '('
+            stmt, string = cls.split_first(string, end=')')
+            stmt = cls.parse(stmt[1:-1].strip() + ";")
+            string = string.strip()
+            # TODO: only block allowed
+            assert string[0] == '{'
+            body, string = StatementsAST.get_statement(string)
+            return UsingStatement([stmt, body]), string
+
         if cls.is_decl(string):
             tp, string = cls.get_type(string)
             tp = DottedName(tp)
@@ -355,9 +421,6 @@ class StatementsAST(AST):
         # TODO: checked, unchecked, lock, using, yield
         # TODO: embedded_statement_unsafe ?? Unknown
 
-    @staticmethod
-    def startswith(string, start):
-        return re.match(start + '(?![a-zA-Z0-9\_\@])', string) is not None
 
     @classmethod
     def is_decl(cls, string):
@@ -464,6 +527,9 @@ class ForStatement(StatementAST):
 class ForEachStatement(StatementAST):
     pass
 
+class UsingStatement(StatementAST):
+    pass
+
 class DeclarationsStatement(StatementAST):
     pass
 
@@ -517,7 +583,6 @@ class ExpressionAST(AST):
                 expr2, string = cls.get_expression(string)
                 return __class__([expr, expr2]), string
         else:
-            ops = []
             for pref_un in cls.PREF_UNARY:
                 if string.startswith(pref_un):
                     l = len(pref_un)
@@ -526,10 +591,9 @@ class ExpressionAST(AST):
                     return __class__([op, expr]), string
             ind = re.match(cls.CONSTANT, string).end()
             name, string = DottedName(string[:ind]), string[ind:]
-            expr = __class__([*ops, name])
             if name.children == ["new"]:
-                assert not ops
                 return cls.get_new_obj(string.strip())
+            expr = __class__([name])
 
         string = string.strip()
         if not string or string[0] in ',;:':
@@ -539,7 +603,7 @@ class ExpressionAST(AST):
             if string.startswith(post_un):
                 l = len(post_un)
                 op, string = Operator(post_un), string[l:].strip()
-                if string:
+                if string and string[0] not in ',;:':
                     nexpr, string = cls.get_expression(string)
                     p = [nexpr]
                 else:
@@ -575,7 +639,23 @@ class ExpressionAST(AST):
                             name = name[1:].strip()
                     mems.extend([mem, *params])
                 else:
-                    break
+                    if string.startswith("<"):
+                        mem = Operator("<")
+                        string_ = string[1:].strip()
+                        obj = re.match(cls.DOTTED_NAME_PATTERN, string_)
+                        if obj is None:
+                            break
+                        ind = obj.end()
+                        name = string_[:ind]
+                        string_ = string_[ind:].strip()
+                        if string_ and string_[0] == ">":
+                            name = cls.parse(name)
+                            mems.extend([mem, name])
+                            string = string_[1:].strip()
+                        else:
+                            break
+                    else:
+                        break
 
 
         if not string or string[0] in ',;:':
@@ -585,11 +665,25 @@ class ExpressionAST(AST):
             if string.startswith(binop):
                 op = Operator(binop)
                 string = string[len(binop):].strip()
+                operands = []
                 if binop in ["is", "as"]:
                     sop, string = cls.get_type(string)
+                    operands.append(DottedName(sop))
+                    string = string.strip()
+                    if binop == "is":
+                        obj = re.match(cls.NAME_PATTERN, string)
+                        if obj is not None:
+                            ind = obj.end()
+                            top, string = string[:ind], string[ind:].strip()
+                            operands.append(DottedName(top))
+                        else:
+                            top, string = cls.get_expression(f"A {string}")
+                            top = top.children[1:]
+                            operands.extend(top)
                 else:
                     sop, string = cls.get_expression(string)
-                return __class__([expr, *mems, op, sop]), string
+                    operands.append(sop)
+                return __class__([expr, *mems, op, *operands]), string
 
         if string[0] == "?":
             texpr, string = cls.get_expression(string[1:].strip())
@@ -598,27 +692,24 @@ class ExpressionAST(AST):
             fexpr, string = cls.get_expression(string[1:].strip())
             string = string.strip()
             return __class__([expr, texpr, fexpr]), string
-        print('----', expr, '---', string)
+        print('----', expr, '---', string[:200])
         assert False
 
     @classmethod
     def is_assignment(cls, string):
-        obj = re.match(cls.DOTTED_MEMBER_NAME_PATTERN, string)
-        if obj is None:
+        name, s = cls.get_dotted_member_name(string)
+        if name is None:
             return False
-        ind = obj.end()
-        s = string[ind:].strip()
         return any(s.startswith(eq) for eq in ['=', '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=', '<<=', '>>=']) and not s.startswith('==')
 
     @classmethod
     def get_assignment(cls, string):
         assert cls.is_assignment(string)
-        ind = re.match(cls.DOTTED_MEMBER_NAME_PATTERN, string).end()
-        member, string = string[:ind], string[ind:]
+        member, string = cls.get_dotted_member_name(string)
         ind = string.index('=')
-        assign_op, string = string[:ind + 1], string[ind + 1:]
+        assign_op, string = string[:ind + 1].strip(), string[ind + 1:].strip()
         expr, string = cls.get_expression(string)
-        return AssignmentAST([DottedName(member), Operator(assign_op), expr]), string
+        return AssignmentAST([member, Operator(assign_op), expr]), string
 
     @classmethod
     def is_lambda(cls, string):
@@ -669,13 +760,13 @@ class ExpressionAST(AST):
         if string.startswith("{"):
             expr, string = cls.split_first(string, end='}')
             expr = expr[1:-1].strip()
-            iskv = cls.is_kv(string)
+            iskv = cls.is_kv(expr)
             if call:
                 assert iskv
             while expr:
                 if iskv:
                     ind = re.match(cls.NAME_PATTERN, expr).end()
-                    params.append(expr[:ind])
+                    params.append(DottedName(expr[:ind]))
                     expr = expr[ind:].strip()
                     assert expr[0] == '='
                     expr = expr[1:].strip()
@@ -747,7 +838,7 @@ class DottedName(AST):
                 super().__init__([nm1, nm2, *name])
             else:
                 nm1, name = __class__(name[:indtp].strip()), name[indtp:]
-                nm2, name = self.split_first(name, end='>')
+                nm2, name = self.split_first(name, end='>', opensadd="<", closesadd=">")
                 nm2 = __class__(nm2[1:-1])
                 name = name.strip()
                 name = __class__(f"A{name}").children[1:]
@@ -774,5 +865,5 @@ class Operator(AST):
         self.name = name.strip()
         super().__init__([name.strip()])
 
-    def __repr__(self, tab=0):
+    def __repr__(self, tab=0, **kwargs):
         return '  ' * tab + self.name
